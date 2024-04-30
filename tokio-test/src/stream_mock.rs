@@ -39,6 +39,7 @@ use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
 
+use futures::Sink;
 use futures_core::{ready, Stream};
 use std::future::Future;
 use tokio::time::{sleep_until, Instant, Sleep};
@@ -46,6 +47,7 @@ use tokio::time::{sleep_until, Instant, Sleep};
 #[derive(Debug, Clone)]
 enum Action<T: Unpin> {
     Next(T),
+    Consume(T),
     Wait(Duration),
 }
 
@@ -67,13 +69,11 @@ impl<T: Unpin> StreamMockBuilder<T> {
         self
     }
 
-    // Queue an item to be consumed by the sink,
-    // commented out until Sink is implemented.
-    //
-    // pub fn consume(mut self, value: T) -> Self {
-    //    self.actions.push_back(Action::Consume(value));
-    //    self
-    // }
+    /// Queue an item to be consumed by the sink
+    pub fn consume(mut self, value: T) -> Self {
+        self.actions.push_back(Action::Consume(value));
+        self
+    }
 
     /// Queue the stream to wait for a duration
     pub fn wait(mut self, duration: Duration) -> Self {
@@ -111,6 +111,13 @@ impl<T: Unpin> StreamMock<T> {
     fn next_action(&mut self) -> Option<Action<T>> {
         self.actions.pop_front()
     }
+
+    fn undropped_count(&self) -> usize {
+        self.actions
+            .iter()
+            .filter(|action| matches!(action, Action::Next(_) | Action::Consume(_)))
+            .count()
+    }
 }
 
 impl<T: Unpin> Stream for StreamMock<T> {
@@ -130,6 +137,7 @@ impl<T: Unpin> Stream for StreamMock<T> {
         match self.next_action() {
             Some(action) => match action {
                 Action::Next(item) => Poll::Ready(Some(item)),
+                Action::Consume(_) => Poll::Pending,
                 Action::Wait(duration) => {
                     // Set up a sleep future and schedule this future to be polled again for it.
                     self.sleep = Some(Box::pin(sleep_until(Instant::now() + duration)));
@@ -143,6 +151,65 @@ impl<T: Unpin> Stream for StreamMock<T> {
     }
 }
 
+impl<T: PartialEq + Unpin> Sink<T> for StreamMock<T> {
+    // TODO: Hm. This is tricky. Don't want to add the error type to StreamMock.
+    // On the other hand the simulation sink errors might be useful.
+    type Error = ();
+
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        // TODO: return Poll::Pending if the next action is not a Consume?
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(mut self: std::pin::Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
+        match self.next_action() {
+            Some(action) => match action {
+                Action::Next(_) => {
+                    panic!("StreamMock expected a consume action, but got a next action")
+                }
+                Action::Consume(next) if next == item => Ok(()),
+                Action::Consume(_) => {
+                    panic!("StreamMock expected a consume action, but got a different item")
+                }
+                Action::Wait(_) => {
+                    panic!("StreamMock expected a consume action, but got a wait action")
+                }
+            },
+            None => panic!("StreamMock expected a consume action, but got no actions left"),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        // Avoid double panicking to make debugging easier.
+        if std::thread::panicking() {
+            return Poll::Ready(Ok(()));
+        }
+
+        let undropped_count = self.undropped_count();
+
+        assert!(
+            undropped_count == 0,
+            "StreamMock was closed before all actions were consumed, {} actions were not consumed",
+            undropped_count
+        );
+
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl<T: Unpin> Drop for StreamMock<T> {
     fn drop(&mut self) {
         // Avoid double panicking to make debugging easier.
@@ -150,14 +217,7 @@ impl<T: Unpin> Drop for StreamMock<T> {
             return;
         }
 
-        let undropped_count = self
-            .actions
-            .iter()
-            .filter(|action| match action {
-                Action::Next(_) => true,
-                Action::Wait(_) => false,
-            })
-            .count();
+        let undropped_count = self.undropped_count();
 
         assert!(
             undropped_count == 0,

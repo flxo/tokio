@@ -1,3 +1,4 @@
+use futures::SinkExt;
 use futures_util::StreamExt;
 use std::time::Duration;
 use tokio_test::stream_mock::StreamMockBuilder;
@@ -47,4 +48,20 @@ async fn test_stream_mock_drop_without_consuming_all() {
 async fn test_stream_mock_drop_during_panic_doesnt_mask_panic() {
     let _stream_mock = StreamMockBuilder::new().next(1).next(2).build();
     panic!("test panic was not masked");
+}
+
+#[tokio::test]
+async fn test_stream_mock_send_expected() {
+    let mut stream_mock = StreamMockBuilder::new()
+        .next(1)
+        .consume(2)
+        .consume(3)
+        .next(4)
+        .build();
+
+    assert_eq!(stream_mock.next().await, Some(1));
+    assert_eq!(stream_mock.send(2).await, Ok(()));
+    assert_eq!(stream_mock.send(3).await, Ok(()));
+    assert_eq!(stream_mock.next().await, Some(4));
+    assert_eq!(stream_mock.next().await, None);
 }
